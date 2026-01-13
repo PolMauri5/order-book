@@ -9,3 +9,9 @@ pub struct OrderBook {
     pub bids: BTreeMap<Decimal, PriceLevel>, // price -> orders, orden descendete
     pub asks: BTreeMap<Decimal, PriceLevel> // price -> orders, orden ascendente
 }
+
+impl OrderBook {
+    pub fn new() -> Self {
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new() }
+    }
+}
