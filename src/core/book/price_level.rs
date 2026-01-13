@@ -10,7 +10,7 @@ pub struct PriceLevel {
     // Añadir al final con push_back
     // Sacar del frente con pop_front
     // Mas eficiente que Vec
-    pub orders: VecDeque<Order>, // FIFO Queue
+    pub order_ids: VecDeque<u64>, // FIFO Queue
     // Lo necesitamos para matching rapdio, podriamos ver si hay
     // cantidad suficiente para un match real o total si iterar por todos
     // los precios de las ordenes
