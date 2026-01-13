@@ -34,6 +34,7 @@ pub enum Event {
     OrderPartiallyFilled {
         order_id: u64,
         filled_quantity: Decimal,
+        remaining_quantity: Decimal,
     },
 
     // Orden completamente ejecutada
