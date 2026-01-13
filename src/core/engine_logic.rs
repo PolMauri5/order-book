@@ -1,31 +1,22 @@
-use std::collections::VecDeque;
-
+use std::{collections::VecDeque, sync::BarrierWaitResult};
 use rust_decimal::Decimal;
 
 use crate::core::{
-    book::price_level::PriceLevel,
+    book::{order_book, price_level::PriceLevel},
     state::{engine_state::EngineState, live_order::LiveOrder},
-    types::{event::Event, side::Side, trade::Trade},
+    types::{event::Event, side::Side, trade::{self, Trade}},
 };
 
-/// Arquitectura:
-/// - EngineState guarda TODO el estado del motor (order_book + live_orders + contadores).
-/// - apply_event es el punto de entrada para mutar estado mediante eventos.
-///   De momento solo soporta Event::NewOrder.
-/// - match_order ejecuta matching "top-of-book":
-///   cruza mejor bid vs mejor ask, FIFO dentro del nivel.
-/// Nota:
-/// - De momento solo gestionamos limit orders con Some(price), no market orders.
 impl EngineState {
-    /// Mutamos el estado (insert, cancel, modify...)
-    /// Devolvemos un evento de salida (accepted, rejected...)
     pub fn apply_event(&mut self, event: Event) -> Vec<Event> {
         let mut out_events = Vec::new();
 
         match event {
+            // En caso de nueva orden
             Event::NewOrder(order) => {
                 // Validación mínima
                 if order.quantity.is_zero() {
+                    // "Ejecutamos" el evento de orden rechazada
                     out_events.push(Event::OrderRejected {
                         order_id: order.order_id,
                         reason: "Quantity must be > 0".to_string(),
@@ -40,93 +31,202 @@ impl EngineState {
                     order,
                 };
 
+                // Sacamos el order_id para no tener problemas de ownership con order
                 let order_id = live_order.order.order_id;
-                let price = live_order.order.price;
 
-                // Si es limit (tiene precio), entra al book en su lado y a su nivel FIFO
-                // De momento no gestionamos market orders
-                if let Some(price) = price {
-                    let book_side = match live_order.order.side {
-                        Side::Bid => &mut self.order_book.bids,
-                        Side::Ask => &mut self.order_book.asks,
-                    };
+                // Miramos si la orden tiene o no Price (limit (sí) o market (no))
+                match live_order.order.price {
+                    // Si tiene price:
+                    Some(price) => {
+                        // Miramos si es una Bid o Ask
+                        let book_side = match live_order.order.side {
+                            Side::Bid => &mut self.order_book.bids,
+                            Side::Ask => &mut self.order_book.asks,
+                        };
 
-                    // entry(price): crea el nivel si no existe y devuelve una ref mutable al level
-                    let level = book_side.entry(price).or_insert_with(|| PriceLevel {
-                        order_ids: VecDeque::new(),
-                        total_quantity: Decimal::ZERO,
-                    });
+                        // En caso de que no existe el level, lo creamos
+                        let level = book_side.entry(price).or_insert_with(|| PriceLevel {
+                            order_ids: VecDeque::new(),
+                            total_quantity: Decimal::ZERO,
+                        });
 
-                    // Cache de volumen del nivel + FIFO por order_id
-                    level.total_quantity += live_order.remaining_quantity;
-                    level.order_ids.push_back(order_id);
+                        // Insertamos info en el level en orden
+                        level.total_quantity += live_order.remaining_quantity;
+                        level.order_ids.push_back(order_id);
+
+                        // Insertamos en el live order, sin orden
+                        self.live_orders.insert(order_id, live_order);
+                    }
+                    None => {
+                        // En caso de no tener price, creamos un market_order
+                        self.active_order.push_back(live_order);
+                    }
                 }
-
-                // Guardamos la orden en el mapa canónico
-                self.live_orders.insert(order_id, live_order);
-
-                // Evento de salida: aceptada
+                // "Ejecutamos" el evento de orden aceptada 
                 out_events.push(Event::OrderAccepted { order_id });
             }
-            // Por ahora ignoramos el resto
             _ => {}
         }
 
         out_events
     }
 
-    /// Matching básico: cruza mejor bid con mejor ask mientras haya cruce y liquidez.
     pub fn match_order(&mut self) -> Vec<Event> {
         let mut out_events = Vec::new();
 
+        // Priorizamos las market orders por orden de llegada que toman liquidez
+        while let Some(mut active) = self.active_order.pop_front() {
+            loop {
+                // Accedemos al price y order id del Live order
+                let (price, pasive_order_id) = match active.order.side {
+                    // En caso de ser Bid
+                    Side::Bid => {
+                        // Cogemos el ask_price (que es el price level con el que compararemos)
+                        let ask_price = match self.order_book.asks.keys().next().cloned() {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        // Cogemos el PriceLevel para acceder a las ordenes
+                        let level = self.order_book.asks.get(&ask_price).unwrap();
+                        if level.order_ids.is_empty() {
+                            break;
+                        }
+                        // Sacamos la "primera" orden exsitente de ese PriceLevel
+                        (ask_price, *level.order_ids.front().unwrap())
+                    }
+                    // En caso de ask hacemos lo mismo al reves
+                    Side::Ask => {
+                        let bid_price = match self.order_book.bids.keys().next_back().cloned() {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        let level = self.order_book.bids.get(&bid_price).unwrap();
+                        if level.order_ids.is_empty() {
+                            break;
+                        }
+                        (bid_price, *level.order_ids.front().unwrap())
+                    }
+                };
+
+                // Sacamos la live order contra la que atacamos
+                let mut pasive = self.live_orders.remove(&pasive_order_id).unwrap();
+                // Sacamos el min entre la market order y la pasive
+                let qty = active.remaining_quantity.min(pasive.remaining_quantity);
+
+                // Ejecutamos el trade
+                let trade = Trade {
+                    trade_id: self.next_trade,
+                    // El comprador puede ser la orden activa o la pasive
+                    // En caso que la orden agresiva sea tipo bid, el comprador have la orden activa
+                    // En caso que la orden agresiva sea tipo ask, el comprador hace la pasiva 
+                    buy_order_id: if active.order.side == Side::Bid {
+                        active.order.order_id
+                    } else {
+                        pasive.order.order_id
+                    },
+                    // El vendedor puede ser la orden activa o pasive
+                    // En caso que la orden agresiva sea tipo ask, el vendedor hace la orden activa
+                    // En caso que la orden agresiva sea tipo bidm el vendedor hace la pasiva
+                    sell_order_id: if active.order.side == Side::Ask {
+                        active.order.order_id
+                    } else {
+                        pasive.order.order_id
+                    },
+                    price,
+                    quantity: qty,
+                    sequence: self.next_sequence,
+                };
+
+                self.next_trade += 1;
+                self.next_sequence += 1;
+
+                out_events.push(Event::Trade(trade));
+
+                active.remaining_quantity -= qty;
+                pasive.remaining_quantity -= qty;
+
+                // Booleano para ver si la pasiva se ha llenado
+                let filled = pasive.remaining_quantity.is_zero();
+
+                // Cogemos todo el PriceLevel del side de la orden pasiva
+                let book_side = match pasive.order.side {
+                    Side::Bid => &mut self.order_book.bids,
+                    Side::Ask => &mut self.order_book.asks,
+                };
+
+                let mut remove_level = false;
+                {
+                    let level = book_side.get_mut(&price).unwrap();
+                    level.total_quantity -= qty;
+                    if filled {
+                        level.order_ids.pop_front();
+                    }
+                    if level.order_ids.is_empty() {
+                        remove_level = true;
+                    }
+                }
+
+                // Eliminamos tood el nivel ya que no hay mas ordenes en el
+                if remove_level {
+                    book_side.remove(&price);
+                }
+
+                // En caso de que no se ejecute toda la orden la volvemos a insertar
+                if !filled {
+                    self.live_orders.insert(pasive_order_id, pasive);
+                }
+
+                // En caso de que la orden activa se haya completado al 100%, finalizamos
+                if active.remaining_quantity.is_zero() {
+                    break;
+                }
+            }
+
+            return out_events;
+        }
+
+        // Resting-resting match (cuando dos limit se consumen entre ellas)
         loop {
-            // Mejor bid/ask (BTreeMap está ordenado ascendente)
+            // Sacamos el best bid
             let bid_price = match self.order_book.bids.keys().next_back().cloned() {
                 Some(p) => p,
                 None => break,
             };
+            // Sacamos el best ask
             let ask_price = match self.order_book.asks.keys().next().cloned() {
                 Some(p) => p,
                 None => break,
             };
 
-            // Si no hay cruce, terminamos
             if bid_price < ask_price {
                 break;
             }
 
-            // Tomar IDs FIFO (sin mantener refs mutables al book)
+            // Sacamos el id de las ordenes que vamos a ejecutar
             let (buy_order_id, sell_order_id) = {
+                // Conseguimos el PriceLevel correcto
                 let bid_level = self.order_book.bids.get(&bid_price).unwrap();
                 let ask_level = self.order_book.asks.get(&ask_price).unwrap();
-
                 if bid_level.order_ids.is_empty() || ask_level.order_ids.is_empty() {
                     break;
                 }
-
                 (
+                    // Buscamos las primeras ordenes de ese PriceLevel
                     *bid_level.order_ids.front().unwrap(),
                     *ask_level.order_ids.front().unwrap(),
                 )
             };
 
-            // Mutar live_orders evitando dos &mut simultáneos al HashMap:
-            // sacamos una orden (remove), mutamos la otra (get_mut), y luego reinsertamos.
             let mut buy_order = self.live_orders.remove(&buy_order_id).unwrap();
             let sell_order = self.live_orders.get_mut(&sell_order_id).unwrap();
 
-            // Cantidad ejecutable
             let quantity = buy_order.remaining_quantity.min(sell_order.remaining_quantity);
 
-            // En esta versión simple fijamos el precio al ask del top-of-book
-            let price = ask_price;
-
-            // Emitir trade puede ser una ejecucion parcial
             let trade = Trade {
                 trade_id: self.next_trade,
                 buy_order_id,
                 sell_order_id,
-                price,
+                price: ask_price,
                 quantity,
                 sequence: self.next_sequence,
             };
@@ -136,24 +236,14 @@ impl EngineState {
 
             out_events.push(Event::Trade(trade));
 
-            // Aplicar fills
             buy_order.remaining_quantity -= quantity;
             sell_order.remaining_quantity -= quantity;
 
             let buy_filled = buy_order.remaining_quantity.is_zero();
             let sell_filled = sell_order.remaining_quantity.is_zero();
 
-            if buy_filled {
-                buy_order.is_active = false;
-            }
-            if sell_filled {
-                sell_order.is_active = false;
-            }
-
-            // Reinsertar la buy ya actualizada que antes habiamos tomado prestada
             self.live_orders.insert(buy_order_id, buy_order);
 
-            // Actualizar niveles por delta (más barato que recomputar sumas)
             let mut remove_bid_level = false;
             let mut remove_ask_level = false;
 
@@ -179,7 +269,6 @@ impl EngineState {
                 }
             }
 
-            // Limpiar niveles vacíos (fuera del scope de &mut)
             if remove_bid_level {
                 self.order_book.bids.remove(&bid_price);
             }
