@@ -17,12 +17,12 @@ There is no networking, persistence, or async logic — the core is fully determ
 
 Implemented:
 - Limit orders
+- Market orders
 - Order validation
 - Price levels and matching
 - Trade generation
 
 Not implemented (yet):
-- Market orders
 - Cancel / modify
 - External integrations
 
