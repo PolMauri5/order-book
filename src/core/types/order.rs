@@ -10,5 +10,5 @@ pub struct Order {
     pub price: Option<Decimal>,
     pub quantity: Decimal,
     // Deterministic arrival order
-    pub arrival_seq: u64,
+    // pub arrival_seq: u64,
 } 
