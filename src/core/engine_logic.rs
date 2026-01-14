@@ -111,7 +111,7 @@ impl EngineState {
                 // Sacamos la live order contra la que atacamos
                 let mut pasive = self.live_orders.remove(&pasive_order_id).unwrap();
                 // Sacamos el min entre la market order y la pasive
-                let qty = active.remaining_quantity.min(pasive.remaining_quantity);
+                let quantity = active.remaining_quantity.min(pasive.remaining_quantity);
 
                 // Ejecutamos el trade
                 let trade = Trade {
@@ -133,7 +133,7 @@ impl EngineState {
                         pasive.order.order_id
                     },
                     price,
-                    quantity: qty,
+                    quantity,
                     sequence: self.next_sequence,
                 };
 
@@ -142,11 +142,32 @@ impl EngineState {
 
                 out_events.push(Event::Trade(trade));
 
-                active.remaining_quantity -= qty;
-                pasive.remaining_quantity -= qty;
+                active.remaining_quantity -= quantity;
+                pasive.remaining_quantity -= quantity;
 
                 // Booleano para ver si la pasiva se ha llenado
-                let filled = pasive.remaining_quantity.is_zero();
+                let pasive_filled = pasive.remaining_quantity.is_zero();
+                let active_filled = active.remaining_quantity.is_zero();
+
+                if pasive_filled {
+                    out_events.push(Event::OrderFilled { order_id: pasive.order.order_id });
+                } else {
+                    out_events.push(Event::OrderPartiallyFilled { 
+                        order_id: pasive.order.order_id, 
+                        filled_quantity: quantity, 
+                        remaining_quantity: pasive.remaining_quantity,
+                    });
+                }
+
+                if active_filled {
+                    out_events.push(Event::OrderFilled { order_id: active.order.order_id });
+                } else {
+                    out_events.push(Event::OrderPartiallyFilled { 
+                        order_id: active.order.order_id, 
+                        filled_quantity: quantity, 
+                        remaining_quantity: active.remaining_quantity,
+                    });
+                }
 
                 // Cogemos todo el PriceLevel del side de la orden pasiva
                 let book_side = match pasive.order.side {
@@ -157,8 +178,8 @@ impl EngineState {
                 let mut remove_level = false;
                 {
                     let level = book_side.get_mut(&price).unwrap();
-                    level.total_quantity -= qty;
-                    if filled {
+                    level.total_quantity -= quantity;
+                    if pasive_filled {
                         level.order_ids.pop_front();
                     }
                     if level.order_ids.is_empty() {
@@ -172,7 +193,7 @@ impl EngineState {
                 }
 
                 // En caso de que no se ejecute toda la orden la volvemos a insertar
-                if !filled {
+                if !pasive_filled {
                     self.live_orders.insert(pasive_order_id, pasive);
                 }
 
@@ -239,8 +260,31 @@ impl EngineState {
             buy_order.remaining_quantity -= quantity;
             sell_order.remaining_quantity -= quantity;
 
+            let buy_remaining = buy_order.remaining_quantity;
+            let sell_remaining = sell_order.remaining_quantity;
+
             let buy_filled = buy_order.remaining_quantity.is_zero();
             let sell_filled = sell_order.remaining_quantity.is_zero();
+
+            if buy_filled {
+                out_events.push(Event::OrderFilled { order_id: buy_order_id });
+            } else {
+                out_events.push(Event::OrderPartiallyFilled {
+                    order_id: buy_order_id,
+                    filled_quantity: quantity,
+                    remaining_quantity: buy_remaining,
+                });
+            }
+
+            if sell_filled {
+                out_events.push(Event::OrderFilled { order_id: sell_order_id });
+            } else {
+                out_events.push(Event::OrderPartiallyFilled {
+                    order_id: sell_order_id,
+                    filled_quantity: quantity,
+                    remaining_quantity: sell_remaining,
+                });
+            }
 
             self.live_orders.insert(buy_order_id, buy_order);
 
