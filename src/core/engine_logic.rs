@@ -182,7 +182,7 @@ impl EngineState {
                 }
             }
 
-            return out_events;
+            continue;
         }
 
         // Resting-resting match (cuando dos limit se consumen entre ellas)
