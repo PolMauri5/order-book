@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use crate::core::{
     book::{order_book, price_level::PriceLevel},
     state::{engine_state::EngineState, live_order::LiveOrder},
-    types::{event::Event, side::Side, trade::{self, Trade}},
+    types::{event::Event, side::{self, Side}, trade::{self, Trade}},
 };
 
 impl EngineState {
@@ -64,6 +64,49 @@ impl EngineState {
                 }
                 // "Ejecutamos" el evento de orden aceptada 
                 out_events.push(Event::OrderAccepted { order_id });
+            }
+
+            Event::CancelOrder { order_id } => {
+                // Esto da None en caso de que el get no ecuentre el order_id
+                // Get mut ya que usamos live mas adelante
+                let (side, price, remaining_qty) = {
+                    let Some(live) = self.live_orders.get(&order_id) else {
+                        out_events.push(Event::OrderRejected { 
+                            order_id, 
+                            reason: "Unknown order_id".to_string(),
+                        });
+                        return out_events;
+                    };
+    
+                    if !live.is_active || live.remaining_quantity.is_zero() {
+                        out_events.push(Event::OrderRejected { 
+                            order_id, 
+                            reason: "Order already inactive or filled".to_string()
+                        });
+                        return out_events;
+                    }
+    
+                    let Some(price) = live.order.price else {
+                        out_events.push(Event::OrderRejected { 
+                            order_id,
+                            reason: "Can not cancel a market order".to_string(),
+                        });
+                        return out_events;
+                    };
+
+                    (live.order.side, price, live.remaining_quantity)
+                };
+
+                // Quitar orden del PriceLevel + ajustar quantity
+                self.remove_resting_order_from_level(side, price, order_id, remaining_qty);
+
+                // Marcar como cancelada
+                if let Some(live) = self.live_orders.get_mut(&order_id) {
+                    live.is_active = false;
+                    live.remaining_quantity = Decimal::ZERO;
+                }
+
+                out_events.push(Event::OrderCanceled { order_id });
             }
             _ => {}
         }
@@ -322,5 +365,37 @@ impl EngineState {
         }
 
         out_events
+    }
+
+    // Private functions
+    fn remove_resting_order_from_level(
+        &mut self,
+        side: Side,
+        price: Decimal,
+        order_id: u64,
+        remaining_qty: Decimal,
+    ) {
+        let book_side = match side {
+            Side::Ask => &mut self.order_book.asks,
+            Side::Bid => &mut self.order_book.bids,
+        };
+
+        if let Some(level) = book_side.get_mut(&price) {
+            // TODO: Make this O(1)
+            // O(n): eliminar el ID de FIFO
+            let before = level.order_ids.len();
+            // Elimina el order_id en caso de encontrarlo
+            level.order_ids.retain(|&id| id != order_id);
+
+            // Si lo ha eliminado significa que si estaba en el Level asi que podemos retirar la qty
+            if level.order_ids.len() != before {
+                level.total_quantity -= remaining_qty;
+            }
+            
+            // En caso de que no queden mas ordenes eliminamos el Level
+            if level.order_ids.is_empty() {
+                book_side.remove(&price);
+            }
+        }
     }
 }
