@@ -12,16 +12,16 @@ impl Engine {
 
     // Punto de entrada del motor.
     pub fn process(&mut self, event: Event) -> Vec<Event> {
-        let mut out = Vec::new();
+        let mut out_events = Vec::new();
 
         // Aplicar evento de entrada (new / cancel / modify...)
-        // Nos devuelve eventos de salida
-        out.extend(self.state.apply_event(event));
+        // Nos devuelve eventos de salida: OrderAccepted o OrderRejected
+        out_events.extend(self.state.apply_event(event));
 
         // Ejecutar matching hasta agotarlo
-        // Genera Trade events
-        out.extend(self.state.match_order());
+        // Nos devuelve eventos de salida: Trade, OrderFilled, OrderPartiallyFilled
+        out_events.extend(self.state.match_order());
 
-        out
+        out_events
     }
 }
