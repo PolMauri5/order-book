@@ -72,7 +72,10 @@ Limit orders support explicit **Time-in-Force (TIF)** semantics:
 
 Implemented:
 - Market orders (IOC semantics)
-- Limit orders (marketable + resting)
+- Limit orders with Time-in-Force:
+  - GTC (Good-Till-Canceled)
+  - IOC (Immediate-Or-Cancel)
+  - FOK (Fill-Or-Kill)
 - Order cancellation
 - Order validation
 - Price levels and FIFO matching
@@ -80,8 +83,7 @@ Implemented:
 - Explicit terminal events for all orders
 
 Not implemented (yet):
-- Order modification
-- Time-in-force variants (FOK, GTC, etc.)
+- Order modification semantics (full TIF re-validation)
 - Auctions / batch matching
 - Persistence
 - Networking / FIX / APIs
