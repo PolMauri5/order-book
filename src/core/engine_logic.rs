@@ -1,28 +1,35 @@
-use std::{collections::VecDeque, sync::BarrierWaitResult};
+use std::collections::VecDeque;
+
 use rust_decimal::Decimal;
 
 use crate::core::{
-    book::{order_book, price_level::PriceLevel},
+    book::price_level::PriceLevel,
     state::{engine_state::EngineState, live_order::LiveOrder},
-    types::{event::Event, side::{self, Side}, trade::{self, Trade}},
+    types::{
+        event::Event,
+        side::Side,
+        trade::Trade,
+    },
 };
 
 impl EngineState {
+    /// Aplica un evento de entrada (New / Cancel...) y deja el estado coherente.
+    /// Importante: aquí decidimos si una LIMIT entra resting o entra como agresora (marketable).
     pub fn apply_event(&mut self, event: Event) -> Vec<Event> {
         let mut out_events = Vec::new();
 
         match event {
-            // En caso de nueva orden
             Event::NewOrder(order) => {
                 // Validación mínima
                 if order.quantity.is_zero() {
-                    // "Ejecutamos" el evento de orden rechazada
                     out_events.push(Event::OrderRejected {
                         order_id: order.order_id,
                         reason: "Quantity must be > 0".to_string(),
                     });
                     return out_events;
                 }
+
+                let order_id = order.order_id;
 
                 // Registrar orden viva (fuente de verdad del remaining/is_active)
                 let live_order = LiveOrder {
@@ -31,76 +38,67 @@ impl EngineState {
                     order,
                 };
 
-                // Sacamos el order_id para no tener problemas de ownership con order
-                let order_id = live_order.order.order_id;
+                let side = live_order.order.side;
+                let price_opt = live_order.order.price;
 
-                // Miramos si la orden tiene o no Price (limit (sí) o market (no))
-                match live_order.order.price {
-                    // Si tiene price:
-                    Some(price) => {
-                        // Miramos si es una Bid o Ask
-                        let book_side = match live_order.order.side {
-                            Side::Bid => &mut self.order_book.bids,
-                            Side::Ask => &mut self.order_book.asks,
-                        };
+                // Guardamos independientemente del tipo de orden en live_orders
+                self.live_orders.insert(order_id, live_order);
 
-                        // En caso de que no existe el level, lo creamos
-                        let level = book_side.entry(price).or_insert_with(|| PriceLevel {
-                            order_ids: VecDeque::new(),
-                            total_quantity: Decimal::ZERO,
-                        });
-
-                        // Insertamos info en el level en orden
-                        level.total_quantity += live_order.remaining_quantity;
-                        level.order_ids.push_back(order_id);
-
-                        // Insertamos en el live order, sin orden
-                        self.live_orders.insert(order_id, live_order);
-                    }
+                match price_opt {
+                    // MARKET: siempre entra como agresora (nunca resting)
                     None => {
-                        // En caso de no tener price, creamos un market_order
-                        self.active_order.push_back(live_order);
+                        self.active_order.push_back(order_id);
+                    }
+
+                    // LIMIT: si cruza el spread al llegar -> entra como agresora
+                    //        si NO cruza -> entra resting directamente
+                    Some(limit_price) => {
+                        if self.is_marketable_limit(side, limit_price) {
+                            // Agresora (pero con límite de precio)
+                            self.active_order.push_back(order_id);
+                        } else {
+                            // Resting normal
+                            // Esta sintaxis accede al order_id (key) y puedes acceder al live_order
+                            let remaining = self.live_orders[&order_id].remaining_quantity;
+                            self.add_resting_to_book(side, limit_price, order_id, remaining);
+                        }
                     }
                 }
-                // "Ejecutamos" el evento de orden aceptada 
+
                 out_events.push(Event::OrderAccepted { order_id });
             }
 
+            // Cancel Order
             Event::CancelOrder { order_id } => {
-                // Esto da None en caso de que el get no ecuentre el order_id
-                // Get mut ya que usamos live mas adelante
-                let (side, price, remaining_qty) = {
+                let (price, side, remaining_qty) = {
                     let Some(live) = self.live_orders.get(&order_id) else {
-                        out_events.push(Event::OrderRejected { 
-                            order_id, 
+                        out_events.push(Event::OrderRejected {
+                            order_id,
                             reason: "Unknown order_id".to_string(),
                         });
                         return out_events;
                     };
-    
+
                     if !live.is_active || live.remaining_quantity.is_zero() {
-                        out_events.push(Event::OrderRejected { 
-                            order_id, 
-                            reason: "Order already inactive or filled".to_string()
+                        out_events.push(Event::OrderRejected {
+                            order_id,
+                            reason: "Order already inactive or filled".to_string(),
                         });
                         return out_events;
                     }
-    
-                    let Some(price) = live.order.price else {
-                        out_events.push(Event::OrderRejected { 
-                            order_id,
-                            reason: "Can not cancel a market order".to_string(),
-                        });
-                        return out_events;
-                    };
 
-                    (live.order.side, price, live.remaining_quantity)
+                    (live.order.price, live.order.side, live.remaining_quantity)
                 };
 
-                // Quitar orden del PriceLevel + ajustar quantity
-                self.remove_resting_order_from_level(side, price, order_id, remaining_qty);
+                // Si estaba en cola agresora lo quitamos
+                self.remove_from_active_queue(order_id);
 
-                // Marcar como cancelada
+                // Si era limit resting, la quiamos del libro
+                if let Some(price) = price {
+                    self.remove_resting_order_from_level(side, price, order_id, remaining_qty);
+                }
+
+                // Fuente de verdad, marcar como inactiva
                 if let Some(live) = self.live_orders.get_mut(&order_id) {
                     live.is_active = false;
                     live.remaining_quantity = Decimal::ZERO;
@@ -108,75 +106,133 @@ impl EngineState {
 
                 out_events.push(Event::OrderCanceled { order_id });
             }
+
             _ => {}
         }
 
         out_events
     }
 
+    /// Matching SOLO impulsado por órdenes agresoras (market o limit marketable).
+    /// - Market consume hasta donde haya liquidez y el remanente se cancela (IOC implícito).
+    /// - Limit marketable consume mientras el precio pasivo cumpla el límite;
+    ///   si queda remanente, pasa a resting en su price level.
     pub fn match_order(&mut self) -> Vec<Event> {
         let mut out_events = Vec::new();
 
-        // Priorizamos las market orders por orden de llegada que toman liquidez
-        while let Some(mut active) = self.active_order.pop_front() {
+        // Procesar agresoras FIFO
+        while let Some(active_id) = self.active_order.pop_front() {
+            // Si no existe en live_orders (no debería), saltamos
+            let Some((active_side, active_price_opt)) = self
+                .live_orders
+                .get(&active_id)
+                .map(|o| (o.order.side, o.order.price))
+            else {
+                continue;
+            };
+
+            // Loop de fills para esa agresora
             loop {
-                // Accedemos al price y order id del Live order
-                let (price, pasive_order_id) = match active.order.side {
-                    // En caso de ser Bid
+                // Si la activa ya no está activa o está llena, terminamos
+                let active_remaining = match self.live_orders.get(&active_id) {
+                    Some(live) if live.is_active && !live.remaining_quantity.is_zero() => live.remaining_quantity,
+                    _ => break,
+                };
+
+                // Encontrar best pasiva del lado contrario
+                let (passive_price, passive_id) = match active_side {
                     Side::Bid => {
-                        // Cogemos el ask_price (que es el price level con el que compararemos)
+                        // Mejor ask
                         let ask_price = match self.order_book.asks.keys().next().cloned() {
                             Some(p) => p,
                             None => break,
                         };
-                        // Cogemos el PriceLevel para acceder a las ordenes
-                        let level = self.order_book.asks.get(&ask_price).unwrap();
-                        if level.order_ids.is_empty() {
-                            break;
+
+                        // Si la agresora es LIMIT BID, debe cumplir ask_price <= limit_price
+                        // TODO: Ver que pasa cunado ya no cumple
+                        if let Some(limit_price) = active_price_opt {
+                            if ask_price > limit_price {
+                                // Ya no puede cruzar más por precio
+                                break;
+                            }
                         }
-                        // Sacamos la "primera" orden exsitente de ese PriceLevel
-                        (ask_price, *level.order_ids.front().unwrap())
+
+                        let level = self.order_book.asks.get(&ask_price).unwrap();
+                        let Some(&id) = level.order_ids.front() else { break };
+                        (ask_price, id)
                     }
-                    // En caso de ask hacemos lo mismo al reves
+
                     Side::Ask => {
+                        // Mejor bid
                         let bid_price = match self.order_book.bids.keys().next_back().cloned() {
                             Some(p) => p,
                             None => break,
                         };
-                        let level = self.order_book.bids.get(&bid_price).unwrap();
-                        if level.order_ids.is_empty() {
-                            break;
+
+                        // Si la agresora es LIMIT ASK, debe cumplir bid_price >= limit_price
+                        if let Some(limit_price) = active_price_opt {
+                            if bid_price < limit_price {
+                                break;
+                            }
                         }
-                        (bid_price, *level.order_ids.front().unwrap())
+
+                        let level = self.order_book.bids.get(&bid_price).unwrap();
+                        let Some(&id) = level.order_ids.front() else { break };
+                        (bid_price, id)
                     }
                 };
 
-                // Sacamos la live order contra la que atacamos
-                let mut pasive = self.live_orders.remove(&pasive_order_id).unwrap();
-                // Sacamos el min entre la market order y la pasive
-                let quantity = active.remaining_quantity.min(pasive.remaining_quantity);
+                // Sacamos pasiva del mapa para evitar conflictos de borrow
+                let mut passive = match self.live_orders.remove(&passive_id) {
+                    Some(p) => p,
+                    None => {
+                        // Book sucio: id en level que no existe en live_orders
+                        // Limpieza mínima: sacamos el front y seguimos
+                        let book_side = match active_side {
+                            Side::Bid => &mut self.order_book.asks,
+                            Side::Ask => &mut self.order_book.bids,
+                        };
 
-                // Ejecutamos el trade
+                        if let Some(level) = book_side.get_mut(&passive_price) {
+                            level.order_ids.pop_front();
+                            if level.order_ids.is_empty() {
+                                book_side.remove(&passive_price);
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+                // Si pasiva está inactiva, limpiamos y seguimos
+                if !passive.is_active || passive.remaining_quantity.is_zero() {
+                    let book_side = match passive.order.side {
+                        Side::Bid => &mut self.order_book.bids,
+                        Side::Ask => &mut self.order_book.asks,
+                    };
+
+                    if let Some(level) = book_side.get_mut(&passive_price) {
+                        if level.order_ids.front().copied() == Some(passive_id) {
+                            level.order_ids.pop_front();
+                        }
+                        if level.order_ids.is_empty() {
+                            book_side.remove(&passive_price);
+                        }
+                    }
+
+                    // no reinsert
+                    continue;
+                }
+
+                // Qty ejecutada
+                let qty = active_remaining.min(passive.remaining_quantity);
+
+                // Price = precio pasivo (best del libro), regla típica para CLOB
                 let trade = Trade {
                     trade_id: self.next_trade,
-                    // El comprador puede ser la orden activa o la pasive
-                    // En caso que la orden agresiva sea tipo bid, el comprador have la orden activa
-                    // En caso que la orden agresiva sea tipo ask, el comprador hace la pasiva 
-                    buy_order_id: if active.order.side == Side::Bid {
-                        active.order.order_id
-                    } else {
-                        pasive.order.order_id
-                    },
-                    // El vendedor puede ser la orden activa o pasive
-                    // En caso que la orden agresiva sea tipo ask, el vendedor hace la orden activa
-                    // En caso que la orden agresiva sea tipo bidm el vendedor hace la pasiva
-                    sell_order_id: if active.order.side == Side::Ask {
-                        active.order.order_id
-                    } else {
-                        pasive.order.order_id
-                    },
-                    price,
-                    quantity,
+                    buy_order_id: if active_side == Side::Bid { active_id } else { passive_id },
+                    sell_order_id: if active_side == Side::Ask { active_id } else { passive_id },
+                    price: passive_price,
+                    quantity: qty,
                     sequence: self.next_sequence,
                 };
 
@@ -185,189 +241,155 @@ impl EngineState {
 
                 out_events.push(Event::Trade(trade));
 
-                active.remaining_quantity -= quantity;
-                pasive.remaining_quantity -= quantity;
+                // Mutar activa
+                {
+                    let active = self.live_orders.get_mut(&active_id).unwrap();
+                    active.remaining_quantity -= qty;
 
-                // Booleano para ver si la pasiva se ha llenado
-                let pasive_filled = pasive.remaining_quantity.is_zero();
-                let active_filled = active.remaining_quantity.is_zero();
+                    if active.remaining_quantity.is_zero() {
+                        out_events.push(Event::OrderFilled { order_id: active_id });
+                    } else {
+                        out_events.push(Event::OrderPartiallyFilled {
+                            order_id: active_id,
+                            filled_quantity: qty,
+                            remaining_quantity: active.remaining_quantity,
+                        });
+                    }
+                }
 
-                if pasive_filled {
-                    out_events.push(Event::OrderFilled { order_id: pasive.order.order_id });
+                // Mutar pasiva (local)
+                passive.remaining_quantity -= qty;
+
+                let passive_filled = passive.remaining_quantity.is_zero();
+                if passive_filled {
+                    out_events.push(Event::OrderFilled { order_id: passive_id });
+                    passive.is_active = false;
                 } else {
-                    out_events.push(Event::OrderPartiallyFilled { 
-                        order_id: pasive.order.order_id, 
-                        filled_quantity: quantity, 
-                        remaining_quantity: pasive.remaining_quantity,
+                    out_events.push(Event::OrderPartiallyFilled {
+                        order_id: passive_id,
+                        filled_quantity: qty,
+                        remaining_quantity: passive.remaining_quantity,
                     });
                 }
 
-                if active_filled {
-                    out_events.push(Event::OrderFilled { order_id: active.order.order_id });
-                } else {
-                    out_events.push(Event::OrderPartiallyFilled { 
-                        order_id: active.order.order_id, 
-                        filled_quantity: quantity, 
-                        remaining_quantity: active.remaining_quantity,
-                    });
-                }
-
-                // Cogemos todo el PriceLevel del side de la orden pasiva
-                let book_side = match pasive.order.side {
+                // Actualizar el level pasivo (siempre front FIFO)
+                let book_side = match passive.order.side {
                     Side::Bid => &mut self.order_book.bids,
                     Side::Ask => &mut self.order_book.asks,
                 };
 
                 let mut remove_level = false;
                 {
-                    let level = book_side.get_mut(&price).unwrap();
-                    level.total_quantity -= quantity;
-                    if pasive_filled {
-                        level.order_ids.pop_front();
+                    let level = book_side.get_mut(&passive_price).unwrap();
+                    level.total_quantity -= qty;
+
+                    // atacamos al front; si se llenó, lo sacamos del FIFO
+                    if passive_filled {
+                        if level.order_ids.front().copied() == Some(passive_id) {
+                            level.order_ids.pop_front();
+                        }
                     }
+
                     if level.order_ids.is_empty() {
                         remove_level = true;
                     }
                 }
 
-                // Eliminamos tood el nivel ya que no hay mas ordenes en el
                 if remove_level {
-                    book_side.remove(&price);
+                    book_side.remove(&passive_price);
                 }
 
-                // En caso de que no se ejecute toda la orden la volvemos a insertar
-                if !pasive_filled {
-                    self.live_orders.insert(pasive_order_id, pasive);
+                // Reinsertar pasiva si queda qty
+                if !passive_filled {
+                    self.live_orders.insert(passive_id, passive);
                 }
 
-                // En caso de que la orden activa se haya completado al 100%, finalizamos
-                if active.remaining_quantity.is_zero() {
+                // Si la activa se llenó, salimos
+                let done = self
+                    .live_orders
+                    .get(&active_id)
+                    .map(|o| o.remaining_quantity.is_zero())
+                    .unwrap_or(true);
+
+                if done {
                     break;
                 }
             }
 
-            continue;
+            // Post-proceso de la agresora:
+            // - Si es MARKET y queda remanente -> se cancela/expira (IOC implícito).
+            // - Si es LIMIT y queda remanente -> pasa a resting en su price level.
+            if let Some(active) = self.live_orders.get_mut(&active_id) {
+                if active.is_active && !active.remaining_quantity.is_zero() {
+                    match active.order.price {
+                        None => {
+                            // MARKET: no puede quedarse en libro
+                            out_events.push(Event::OrderCanceled { order_id: active_id });
+                            active.is_active = false;
+                            active.remaining_quantity = Decimal::ZERO;
+                        }
+                        Some(limit_price) => {
+                            // LIMIT: el remanente se vuelve resting
+                            let side = active.order.side;
+                            let remaining = active.remaining_quantity;
+
+                            self.add_resting_to_book(side, limit_price, active_id, remaining);
+                            // sigue activa (resting)
+                        }
+                    }
+                }
+            }
         }
 
-        // Resting-resting match (cuando dos limit se consumen entre ellas)
-        loop {
-            // Sacamos el best bid
-            let bid_price = match self.order_book.bids.keys().next_back().cloned() {
-                Some(p) => p,
-                None => break,
-            };
-            // Sacamos el best ask
-            let ask_price = match self.order_book.asks.keys().next().cloned() {
-                Some(p) => p,
-                None => break,
-            };
-
-            if bid_price < ask_price {
-                break;
-            }
-
-            // Sacamos el id de las ordenes que vamos a ejecutar
-            let (buy_order_id, sell_order_id) = {
-                // Conseguimos el PriceLevel correcto
-                let bid_level = self.order_book.bids.get(&bid_price).unwrap();
-                let ask_level = self.order_book.asks.get(&ask_price).unwrap();
-                if bid_level.order_ids.is_empty() || ask_level.order_ids.is_empty() {
-                    break;
-                }
-                (
-                    // Buscamos las primeras ordenes de ese PriceLevel
-                    *bid_level.order_ids.front().unwrap(),
-                    *ask_level.order_ids.front().unwrap(),
-                )
-            };
-
-            let mut buy_order = self.live_orders.remove(&buy_order_id).unwrap();
-            let sell_order = self.live_orders.get_mut(&sell_order_id).unwrap();
-
-            let quantity = buy_order.remaining_quantity.min(sell_order.remaining_quantity);
-
-            let trade = Trade {
-                trade_id: self.next_trade,
-                buy_order_id,
-                sell_order_id,
-                price: ask_price,
-                quantity,
-                sequence: self.next_sequence,
-            };
-
-            self.next_trade += 1;
-            self.next_sequence += 1;
-
-            out_events.push(Event::Trade(trade));
-
-            buy_order.remaining_quantity -= quantity;
-            sell_order.remaining_quantity -= quantity;
-
-            let buy_remaining = buy_order.remaining_quantity;
-            let sell_remaining = sell_order.remaining_quantity;
-
-            let buy_filled = buy_order.remaining_quantity.is_zero();
-            let sell_filled = sell_order.remaining_quantity.is_zero();
-
-            if buy_filled {
-                out_events.push(Event::OrderFilled { order_id: buy_order_id });
-            } else {
-                out_events.push(Event::OrderPartiallyFilled {
-                    order_id: buy_order_id,
-                    filled_quantity: quantity,
-                    remaining_quantity: buy_remaining,
-                });
-            }
-
-            if sell_filled {
-                out_events.push(Event::OrderFilled { order_id: sell_order_id });
-            } else {
-                out_events.push(Event::OrderPartiallyFilled {
-                    order_id: sell_order_id,
-                    filled_quantity: quantity,
-                    remaining_quantity: sell_remaining,
-                });
-            }
-
-            self.live_orders.insert(buy_order_id, buy_order);
-
-            let mut remove_bid_level = false;
-            let mut remove_ask_level = false;
-
-            {
-                let bid_level = self.order_book.bids.get_mut(&bid_price).unwrap();
-                bid_level.total_quantity -= quantity;
-                if buy_filled {
-                    bid_level.order_ids.pop_front();
-                }
-                if bid_level.order_ids.is_empty() {
-                    remove_bid_level = true;
-                }
-            }
-
-            {
-                let ask_level = self.order_book.asks.get_mut(&ask_price).unwrap();
-                ask_level.total_quantity -= quantity;
-                if sell_filled {
-                    ask_level.order_ids.pop_front();
-                }
-                if ask_level.order_ids.is_empty() {
-                    remove_ask_level = true;
-                }
-            }
-
-            if remove_bid_level {
-                self.order_book.bids.remove(&bid_price);
-            }
-            if remove_ask_level {
-                self.order_book.asks.remove(&ask_price);
-            }
-        }
+        // IMPORTANTE:
+        // No hay resting-vs-resting match.
+        // Si no entra una agresora, no se generan trades.
 
         out_events
     }
 
-    // Private functions
+    /// Una LIMIT es marketable si al llegar cruza el best del lado contrario.
+    fn is_marketable_limit(&self, side: Side, limit_price: Decimal) -> bool {
+        match side {
+            Side::Bid => {
+                // si existe ask y ask <= limit -> cruzable
+                self.order_book
+                    .asks
+                    .keys()
+                    .next()
+                    .cloned()
+                    // Si es None devuelve false
+                    .is_some_and(|best_ask| best_ask <= limit_price)
+            }
+            Side::Ask => {
+                // si existe bid y bid >= limit -> cruzable
+                self.order_book
+                    .bids
+                    .keys()
+                    .next_back()
+                    .cloned()
+                    .is_some_and(|best_bid| best_bid >= limit_price)
+            }
+        }
+    }
+
+    /// Inserta una orden como resting en el price level (FIFO).
+    fn add_resting_to_book(&mut self, side: Side, price: Decimal, order_id: u64, qty: Decimal) {
+        let book_side = match side {
+            Side::Bid => &mut self.order_book.bids,
+            Side::Ask => &mut self.order_book.asks,
+        };
+
+        let level = book_side.entry(price).or_insert_with(|| PriceLevel {
+            order_ids: VecDeque::new(),
+            total_quantity: Decimal::ZERO,
+        });
+
+        level.total_quantity += qty;
+        level.order_ids.push_back(order_id);
+    }
+
+    /// Quita un resting del level y ajusta quantity.
     fn remove_resting_order_from_level(
         &mut self,
         side: Side,
@@ -381,21 +403,25 @@ impl EngineState {
         };
 
         if let Some(level) = book_side.get_mut(&price) {
-            // TODO: Make this O(1)
-            // O(n): eliminar el ID de FIFO
+            // O(n): eliminar el ID del FIFO
             let before = level.order_ids.len();
-            // Elimina el order_id en caso de encontrarlo
             level.order_ids.retain(|&id| id != order_id);
 
-            // Si lo ha eliminado significa que si estaba en el Level asi que podemos retirar la qty
             if level.order_ids.len() != before {
                 level.total_quantity -= remaining_qty;
             }
-            
-            // En caso de que no queden mas ordenes eliminamos el Level
+
             if level.order_ids.is_empty() {
                 book_side.remove(&price);
             }
         }
+    }
+
+    fn remove_from_active_queue(&mut self, order_id: u64) -> bool {
+        let before = self.active_order.len();
+        // Elimina solo el order_id
+        self.active_order.retain(|&id| id != order_id);
+        // Si no tiene la misma len es true
+        self.active_order.len() != before
     }
 }

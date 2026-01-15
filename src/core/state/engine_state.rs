@@ -12,8 +12,8 @@ pub struct EngineState {
     // Estado vivo: cantidad restante, ubicacion, etc.
     pub live_orders: HashMap<u64, LiveOrder>,
 
-    // Active Order
-    pub active_order: VecDeque<LiveOrder>,
+    // Ordenes agresivas
+    pub active_order: VecDeque<u64>,
 
     // Secuencia determinista para trades
     pub next_trade: u64,
