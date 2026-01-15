@@ -6,9 +6,7 @@ use crate::core::{
     book::price_level::PriceLevel,
     state::{engine_state::EngineState, live_order::LiveOrder},
     types::{
-        event::Event,
-        side::Side,
-        trade::Trade,
+        event::Event, order, side::Side, trade::Trade
     },
 };
 
@@ -107,6 +105,65 @@ impl EngineState {
                 out_events.push(Event::OrderCanceled { order_id });
             }
 
+            Event::ModifyOrder { order_id, new_quantity, new_price } => {
+                // Validar que la orden exista y esye activa
+                let (old_price, side, remaining_qty) = {
+                    let Some(live) = self.live_orders.get(&order_id) else {
+                        out_events.push(Event::OrderRejected { 
+                            order_id,
+                            reason: "Unknown order_id".to_string(),
+                        });
+                        return  out_events;
+                    };
+
+                    if !live.is_active || live.remaining_quantity.is_zero() {
+                        out_events.push(Event::OrderRejected { 
+                            order_id,
+                            reason: "Not active or filled".to_string(),
+                        });
+                        return out_events;
+                    }
+
+                    (live.order.price, live.order.side, live.remaining_quantity)
+                };
+
+                // Quitar la orden de cualquier sitio en el que pueda estar
+                if let Some(price) = old_price {
+                    self.remove_resting_order_from_level(side, price, order_id, remaining_qty);
+                }
+                self.remove_from_active_queue(order_id);
+
+                // Actualizar los campos de la orden
+                {
+                    let live = self.live_orders.get_mut(&order_id).unwrap();
+
+                    // Nueva cantidad
+                    live.remaining_quantity = new_quantity;
+
+                    // Nuevo precio
+                    live.order.price = new_price;
+                }
+
+                // Reinyectamos la orden como si fuese nueva
+                let live = self.live_orders.get(&order_id).unwrap();
+                let side = live.order.side;
+
+                match live.order.price {
+                    None => {
+                        self.active_order.push_back(order_id);
+                    }
+                    Some(price) => {
+                        if self.is_marketable_limit(side, price) {
+                            self.active_order.push_back(order_id);
+                        } else {
+                            // Resting
+                            let remaining = live.remaining_quantity;
+                            self.add_resting_to_book(side, price, order_id, remaining);
+                        }
+                    }
+                }
+                out_events.push(Event::OrderAccepted { order_id });
+            }
             _ => {}
         }
 
