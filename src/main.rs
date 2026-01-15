@@ -4,7 +4,7 @@ mod core;
 use std::time::Instant;
 use rust_decimal::Decimal;
 
-use crate::core::{engine::Engine, state::engine_state::EngineState, types::{event::Event, order::Order, side::Side, time_in_force::TimeInForce}};
+use crate::core::{engine_orchestrator::Engine, state::engine_state::EngineState, types::{event::Event, order::Order, side::Side, time_in_force::TimeInForce}};
 
 fn main() {
     let state = EngineState::new();

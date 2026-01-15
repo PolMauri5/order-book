@@ -2,6 +2,7 @@ use rust_decimal::Decimal;
 
 use crate::core::types::{order::Order, trade::Trade};
 
+#[allow(dead_code)]
 pub enum Event {
 
     // Eventos de entrada

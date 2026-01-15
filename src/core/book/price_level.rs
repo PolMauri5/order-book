@@ -2,8 +2,6 @@ use std::collections::VecDeque;
 
 use rust_decimal::Decimal;
 
-use crate::core::types::order::Order;
-
 pub struct PriceLevel {
     // VecDeque: Double-ended queue
     // FIFO / LIFO: 

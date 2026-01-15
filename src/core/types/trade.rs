@@ -2,6 +2,7 @@ use rust_decimal::Decimal;
 
 
 /// Trade does not modify anything, it just descrines what happened.
+#[allow(dead_code)]
 pub struct Trade {
     pub trade_id: u64,
     pub buy_order_id: u64,

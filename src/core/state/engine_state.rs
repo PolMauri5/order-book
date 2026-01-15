@@ -1,4 +1,4 @@
-use crate::core::{book::order_book::OrderBook, state::live_order::LiveOrder, types::order::Order};
+use crate::core::{book::order_book::OrderBook, state::live_order::LiveOrder};
 use std::collections::{HashMap, VecDeque};
 
 /// Esto es el estado mutable del core.
