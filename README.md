@@ -34,10 +34,24 @@ Trades are generated **only** as a direct consequence of an incoming order:
 
 ### Limit orders
 
-- Act as aggressive orders on arrival *if they cross the spread*
-- Consume liquidity up to their limit price
-- Any remaining quantity becomes a resting order
-- Non-marketable limits rest immediately
+Limit orders support explicit **Time-in-Force (TIF)** semantics:
+
+- **GTC (Good-Till-Canceled)**
+  - If marketable on arrival, acts as an aggressor
+  - Any remaining quantity rests in the book
+  - If not marketable, rests immediately
+
+- **IOC (Immediate-Or-Cancel)**
+  - Executes immediately if marketable
+  - May be partially filled
+  - Any remaining quantity is canceled
+  - Never rests in the book
+
+- **FOK (Fill-Or-Kill)**
+  - Executes only if full quantity can be filled immediately
+  - If insufficient liquidity exists, the order is rejected
+  - Never partially fills
+  - Never rests in the book
 
 ### No resting-vs-resting matching
 
