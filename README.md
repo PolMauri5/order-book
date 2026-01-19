@@ -81,9 +81,9 @@ Implemented:
 - Price levels and FIFO matching
 - Trade generation
 - Explicit terminal events for all orders
+- Order modification semantics (full TIF re-validation)
 
 Not implemented (yet):
-- Order modification semantics (full TIF re-validation)
 - Auctions / batch matching
 - Persistence
 - Networking / FIX / APIs
