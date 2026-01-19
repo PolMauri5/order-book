@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 
 use crate::core::{
-    state::{engine_state::EngineState, live_order::LiveOrder},
+    state::{engine_state::EngineState, live_order::{self, LiveOrder}},
     types::{event::Event, time_in_force::TimeInForce},
 };
 
@@ -14,7 +14,7 @@ impl EngineState {
         match event {
             Event::NewOrder(order) => {
                 // Validación mínima
-                if order.quantity.is_zero() {
+                if order.quantity <= Decimal::ZERO {
                     out_events.push(Event::OrderRejected {
                         order_id: order.order_id,
                         reason: "Quantity must be > 0".to_string(),
@@ -22,7 +22,25 @@ impl EngineState {
                     return out_events;
                 }
 
+                if let Some(p) = order.price {
+                    if p <= Decimal::ZERO {
+                        out_events.push(Event::OrderRejected {
+                            order_id: order.order_id,
+                            reason: "If price, it must be > 0".to_string(),
+                        });
+                        return out_events; 
+                    }
+                }
+
                 let order_id = order.order_id;
+
+                if self.live_orders.contains_key(&order_id) {
+                    out_events.push(Event::OrderRejected {
+                        order_id: order.order_id,
+                        reason: "Duplicated order_id".to_string(),
+                    });
+                    return out_events;
+                }
 
                 // Registrar orden viva (fuente de verdad del remaining/is_active)
                 let live_order = LiveOrder {
@@ -155,8 +173,25 @@ impl EngineState {
             }
 
             Event::ModifyOrder { order_id, new_quantity, new_price } => {
+                if new_quantity <= Decimal::ZERO {
+                    out_events.push(Event::OrderRejected {
+                        order_id,
+                        reason: "Quantity must be > 0".to_string(),
+                    });
+                    return out_events;
+                }
+
+                if let Some(p) = new_price {
+                    if p <= Decimal::ZERO {
+                        out_events.push(Event::OrderRejected {
+                            order_id,
+                            reason: "If price, it must be > 0".to_string(),
+                        });
+                        return out_events;
+                    }
+                }
                 // Validar que la orden exista y esye activa
-                let (old_price, side, remaining_qty) = {
+                let (old_price, side, remaining_qty, tif) = {
                     let Some(live) = self.live_orders.get(&order_id) else {
                         out_events.push(Event::OrderRejected { 
                             order_id,
@@ -173,7 +208,7 @@ impl EngineState {
                         return out_events;
                     }
 
-                    (live.order.price, live.order.side, live.remaining_quantity)
+                    (live.order.price, live.order.side, live.remaining_quantity, live.order.time_in_force)
                 };
 
                 // Quitar la orden de cualquier sitio en el que pueda estar
@@ -200,18 +235,70 @@ impl EngineState {
                 match live.order.price {
                     None => {
                         self.active_order.push_back(order_id);
+                        out_events.push(Event::OrderAccepted { order_id });
                     }
-                    Some(price) => {
-                        if self.is_marketable_limit(side, price) {
-                            self.active_order.push_back(order_id);
+                    Some(limit_price) => {
+                        if self.is_marketable_limit(side, limit_price) {
+                            match tif {
+                                // FOK marketable: precheck de liquidez (fill completo o nada)
+                                TimeInForce::FOK => {
+                                    let qty = self.live_orders[&order_id].remaining_quantity;
+
+                                    if !self.has_sufficient_liquidity(side, limit_price, qty) {
+                                        // FOK falla, nada entra al matching
+                                        if let Some(live) = self.live_orders.get_mut(&order_id) {
+                                            live.is_active = false;
+                                            live.remaining_quantity = Decimal::ZERO;
+                                        }
+
+                                        out_events.push(Event::OrderRejected {
+                                            order_id,
+                                            reason: "FOK: insufficient liquidity".to_string(),
+                                        });
+                                    } else {
+                                        self.active_order.push_back(order_id);
+                                        out_events.push(Event::OrderAccepted { order_id });
+                                    }
+                                }
+
+                                // IOC/GTC marketable: entra como agresora
+                                TimeInForce::IOC | TimeInForce::GTC => {
+                                    self.active_order.push_back(order_id);
+                                    out_events.push(Event::OrderAccepted { order_id });
+                                }
+                            }
                         } else {
-                            // Resting
-                            let remaining = live.remaining_quantity;
-                            self.add_resting_to_book(side, price, order_id, remaining);
+                            // No marketeable:
+                            match tif {
+                                TimeInForce::GTC => {
+                                    // Limit GTC no marketable -> resting
+                                    let remaining = self.live_orders[&order_id].remaining_quantity;
+                                    self.add_resting_to_book(side, limit_price, order_id, remaining);
+                                    out_events.push(Event::OrderAccepted { order_id });
+                                }
+                                TimeInForce::IOC => {
+                                    // Limit IOC no marketable -> cancelar inmediatamente
+                                    if let Some(live) = self.live_orders.get_mut(&order_id) {
+                                        live.is_active = false;
+                                        live.remaining_quantity = Decimal::ZERO;
+                                    }
+                                    out_events.push(Event::OrderCanceled { order_id });
+                                }
+                                TimeInForce::FOK => {
+                                    // Limit FOK no marketable -> reject inmediato (no entra al matching)
+                                    if let Some(live) = self.live_orders.get_mut(&order_id) {
+                                        live.is_active = false;
+                                        live.remaining_quantity = Decimal::ZERO;
+                                    }
+                                    out_events.push(Event::OrderRejected {
+                                        order_id,
+                                        reason: "FOK: not marketable".to_string(),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
-                out_events.push(Event::OrderAccepted { order_id });
             }
             _ => {}
         }
